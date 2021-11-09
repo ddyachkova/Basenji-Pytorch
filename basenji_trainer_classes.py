@@ -30,19 +30,22 @@ import math
 
 import torch.cuda.amp as amp
 
-
 class DNA_Iter(Dataset):
-    def __init__(self, input_name, targets_name, num_targets, switch=False, target_window = 128):
+    def __init__(self, input_name, targets_name_cl, targets_name_pdx, switch=False, target_window = 128):
         self.target_window = target_window
         self.seq = self.read_memmap_input(input_name)
-        self.tgt_mmap = self.read_memmap_input(targets_name)
+        self.tgt_mmap_cl = self.read_memmap_input(targets_name_cl)
+        self.tgt_mmap_pdx = self.read_memmap_input(targets_name_pdx)
+
         self.target_window = target_window
         self.nucs = np.arange(6.)
         self.len = (int(self.seq.shape[0] / (self.target_window)))
         self.switch = switch 
         self.switch_func = np.vectorize(lambda x: x + 1 if (x % 2 == 0) else x - 1)
-        self.num_targets = num_targets
-    
+#         self.num_targets = num_targets
+        self.num_targets_cl = 23
+        self.num_targets_pdx = 14
+
     def __len__(self):
         return self.len 
 
@@ -51,8 +54,13 @@ class DNA_Iter(Dataset):
         if self.switch: 
             seq_subset = self.switch_func(list(reversed(seq_subset)))
         dta = self.get_csc_matrix(seq_subset)
-        tgt_window_3 = torch.stack([torch.mean(torch.tensor(np.nan_to_num(self.tgt_mmap[(i*self.seq.shape[0])+(self.target_window*idx): (i*self.seq.shape[0]) +(idx+1)*self.target_window]))) for i in range(self.num_targets)])
-        return torch.tensor(dta), tgt_window_3 
+        tgt_window_cl = torch.stack([torch.mean(torch.tensor(np.nan_to_num(self.tgt_mmap_cl[(i*self.seq.shape[0])+(self.target_window*idx): (i*self.seq.shape[0]) +(idx+1)*self.target_window]))) for i in range(self.num_targets_cl)])
+        tgt_window_pdx = torch.stack([torch.mean(torch.tensor(np.nan_to_num(self.tgt_mmap_pdx[(i*self.seq.shape[0])+(self.target_window*idx): (i*self.seq.shape[0]) +(idx+1)*self.target_window]))) for i in range(self.num_targets_pdx)])
+        tgt_window = torch.cat((tgt_window_cl, tgt_window_pdx))
+#         print(tgt_window_cl.shape)
+#         tgt_window = self.get_targets(idx, self.tgt_mmap_cl, self.tgt_mmap_pdx, self.num_targets_cl, self.num_targets_pdx)
+#         print(tgt_window)
+        return torch.tensor(dta), tgt_window 
     
     def read_numpy_input(self, np_gq_name):
         seq = np.load(np_gq_name)
@@ -84,10 +92,31 @@ class DNA_Iter(Dataset):
         return np.array([np.mean(lst[i:i + n]) for i in range(int(len(lst)/n))])
 
     
-class upd_GELU(nn.Module):
-    def forward(self, input: Tensor) -> Tensor:
-        return torch.sigmoid(torch.Tensor([1.702]).cuda() * input) * input
+    def slice_arr(self, idx, tgt_mmap, num_targets):
+        return torch.tensor(np.nan_to_num(tgt_mmap[idx::int(tgt_mmap.shape[0] / num_targets)].reshape(num_targets, 1)))
 
+    def get_stacked_means(self, idx, tgt_mmap, num_targets):
+        vals = map(functools.partial(self.slice_arr, tgt_mmap=tgt_mmap, num_targets=num_targets), np.arange(idx, idx+128))
+        stacked_means = torch.stack(list(map(sum, zip(*vals)))) / num_targets
+        return stacked_means
+
+    def get_targets(self, idx, tgt_mmap_cl, tgt_mmap_pdx, num_targets_cl, num_targets_pdx):
+        stacked_means_cl = self.get_stacked_means(idx, tgt_mmap_cl, num_targets_cl)
+        stacked_means_pdx = self.get_stacked_means(idx, tgt_mmap_pdx, num_targets_pdx)
+        stacked_full = torch.cat((stacked_means_cl, stacked_means_pdx)).view(stacked_means_cl.shape[0] + stacked_means_pdx.shape[0])
+        return stacked_full
+    
+    
+class upd_GELU(nn.Module):
+    def __init__(self):
+        super(upd_GELU, self).__init__()
+        self.constant_param = nn.Parameter(torch.Tensor([1.702]))
+        self.sig = nn.Sigmoid()
+
+    def forward(self, input: Tensor) -> Tensor:
+        outval = torch.mul(self.sig(torch.mul(self.constant_param, input)), input)
+        return outval
+    
 def ones_(tensor: Tensor) -> Tensor:
     return torch.ones_like(tensor)
 
@@ -218,7 +247,7 @@ class BasenjiModel(nn.Module):
         
         
 class Trainer(nn.Module):
-    def __init__(self, param_vals, model, memmap_data_contigs_dir, memmap_data_targets_dir):
+    def __init__(self, param_vals, model, memmap_data_contigs_dir, memmap_data_targets_dir_cl, memmap_data_targets_dir_pdx):
         super(Trainer, self).__init__()
     
         self.param_vals = param_vals
@@ -232,8 +261,8 @@ class Trainer(nn.Module):
         self.num_targets = self.param_vals.get('num_targets', 1)
         self.make_optimizer()
         self.init_loss()
-        self.make_dsets(memmap_data_contigs_dir, memmap_data_targets_dir)
-
+        self.make_dsets(memmap_data_contigs_dir, memmap_data_targets_dir_cl, memmap_data_targets_dir_pdx)
+        print ('init dsets')
 #         self.model, self.optimizer = amp.initialize(self.model, self.optimizer, opt_level='O1')
 
     def make_optimizer(self): 
@@ -246,33 +275,51 @@ class Trainer(nn.Module):
         if self.param_vals["optimizer"]=="Adagrad":
             self.optimizer = optim.Adagrad(self.model.parameters(), lr=self.param_vals["init_lr"], weight_decay = self.param_vals["weight_decay"])
     
-    def make_dsets(self, input_files_dir, target_files_dir):
+    def make_dsets(self, input_files_dir, target_files_dir_cl, target_files_dir_pdx):
         cut = self.param_vals.get('cut', .8)
         np.random.seed(42)
-        chroms_list = [file.split('_')[0] for file in os.listdir(target_files_dir)]
+        chroms_list = [file.split('_')[0] for file in os.listdir(input_files_dir) if file.split('.')[-1] == 'dta']
         np.random.shuffle(chroms_list)
+        
         input_list = np.hstack([[file for file in os.listdir(input_files_dir) if file.split('_')[0] == chrom] for chrom in chroms_list])
-        targets_list = np.hstack([[file for file in os.listdir(target_files_dir) if file.split('_')[0] == chrom] for chrom in chroms_list])
-
+        targets_cl_list = np.hstack([[file for file in os.listdir(target_files_dir_cl) if file.split('_')[0] == chrom] for chrom in chroms_list])
+        targets_pdx_list = np.hstack([[file for file in os.listdir(target_files_dir_pdx) if file.split('_')[0] == chrom] for chrom in chroms_list])
+#         print(targets_pdx_list)
+        
         val_input_files = input_list[int(len(input_list)*cut):]
-        val_target_files = targets_list[int(len(targets_list)*cut):]
+        val_target_files_cl = targets_cl_list[int(len(targets_cl_list)*cut):]
+        val_target_files_pdx = targets_pdx_list[int(len(targets_pdx_list)*cut):]
 
+        
         train_input_files = input_list[:int(len(input_list)*cut)]
-        train_target_files = targets_list[:int(len(targets_list)*cut)]
+        train_target_cl_files = targets_cl_list[:int(len(targets_cl_list)*cut)]
+        train_target_pdx_files = targets_pdx_list[:int(len(targets_pdx_list)*cut)]
 
-        self.valid_dset = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, val_input_files[i]), os.path.join(target_files_dir, val_target_files[i]), self.num_targets) for i in range(len(val_input_files))])
-        self.training_dset = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, train_input_files[i]), os.path.join(target_files_dir, train_target_files[i]), self.num_targets, switch=False) for i in range(len(train_input_files))])
-        self.training_dset_augm = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, train_input_files[i]), os.path.join(target_files_dir, train_target_files[i]),  self.num_targets, switch=True) for i in range(len(train_input_files))])
+        
+        self.valid_dset = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, val_input_files[i]), 
+                                                  os.path.join(target_files_dir_cl, val_target_files_cl[i]), 
+                                                  os.path.join(target_files_dir_pdx, val_target_files_pdx[i])
+                                                  ) for i in range(len(val_input_files))])
+        
+        self.training_dset = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, train_input_files[i]), 
+                                                     os.path.join(target_files_dir_cl, train_target_cl_files[i]), 
+                                                     os.path.join(target_files_dir_pdx, train_target_pdx_files[i]), 
+                                                     switch=False) for i in range(len(train_input_files))])
+        
+        self.training_dset_augm = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, train_input_files[i]), 
+                                                          os.path.join(target_files_dir_cl, train_target_cl_files[i]),  
+                                                          os.path.join(target_files_dir_pdx, train_target_pdx_files[i]),  
+                                                          switch=True) for i in range(len(train_input_files))])
 
         
     def make_loaders(self, augm):
         batch_size = int(self.param_vals.get('seq_len', 128*128*8)*self.param_vals.get('batch_size', 8)/128)
         num_workers = self.param_vals.get('num_workers', 8)
         if augm: 
-            train_loader = DataLoader(dataset=self.training_dset_augm, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False)
+            train_loader = DataLoader(dataset=self.training_dset_augm, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
         else: 
-            train_loader = DataLoader(dataset=self.training_dset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False)
-        val_loader = DataLoader(dataset=self.valid_dset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False)
+            train_loader = DataLoader(dataset=self.training_dset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+        val_loader = DataLoader(dataset=self.valid_dset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
         return train_loader, val_loader
     
     
@@ -305,7 +352,8 @@ class Trainer(nn.Module):
             return np.array([0]), np.array([0])
 
     def plot_results(self, y, out, num_targets):
-        for i in range(num_targets):
+#         for i in range(num_targets):
+        for i in range(3):
             ys = y[:, :, i].flatten().cpu().numpy()
             preds = out[:, :, i].flatten().detach().cpu().numpy()
             plt.plot(np.arange(len(ys.flatten())), ys.flatten(), label='True')
@@ -314,6 +362,7 @@ class Trainer(nn.Module):
             plt.show()        
     
     def train(self, debug):
+        print('began training')
 #         scaler = torch.cuda.amp.GradScaler(enabled=True)
         for epoch in range(self.param_vals.get('num_epochs', 10)):
             if epoch % 2 == 0: 
@@ -321,9 +370,11 @@ class Trainer(nn.Module):
             else: 
                 augm = True
             train_loader, val_loader = self.make_loaders(augm)
+            print(len(train_loader), len(val_loader))
             for batch_idx, batch in enumerate(train_loader):
+                print(batch_idx)
                 print_res, plot_res = False, False
-                self.model.train()
+                model.train()
                 x, y = self.get_input(batch)
                 if (debug): 
                     print (x.shape, y.shape)
@@ -339,7 +390,7 @@ class Trainer(nn.Module):
                              
             if val_loader:
                 print_res, plot_res = False, False
-                self.model.eval()
+                model.eval()
                 for batch_idx, batch in enumerate(val_loader):
                     print_res, plot_res = False, False 
                     x, y = self.get_input(batch)
