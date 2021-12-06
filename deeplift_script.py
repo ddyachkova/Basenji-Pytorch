@@ -38,7 +38,7 @@ from captum.attr import DeepLift, DeepLiftShap
 
 
 class DNA_Iter(Dataset):
-    def __init__(self, input_name, switch=False, target_window = 128):
+    def __init__(self, input_name, num_targets, switch=False, target_window = 128):
         self.target_window = target_window
         self.seq = self.read_memmap_input(input_name)
 
@@ -47,8 +47,9 @@ class DNA_Iter(Dataset):
         self.len = (int(self.seq.shape[0] / (self.target_window)))
         self.switch = switch 
         self.switch_func = np.vectorize(lambda x: x + 1 if (x % 2 == 0) else x - 1)
-        self.num_targets = 1
-
+        self.num_targets = num_targets
+        self.motif_str = '202131' #'2021312' #'202131203' #'20213'
+    
     def __len__(self):
         return self.len 
 
@@ -57,9 +58,18 @@ class DNA_Iter(Dataset):
         if self.switch: 
             seq_subset = self.switch_func(list(reversed(seq_subset)))
         dta = self.get_csc_matrix(seq_subset)
-        tgt = np.zeros(seq_subset.shape)
-        tgt[np.where(seq_subset == 3.)] = 1.
-        tgt_window = np.mean(tgt)
+        seq_subset_str = "".join([str(int(s)) for s in seq_subset])
+        count = self.count_substr(seq_subset_str, self.motif_str)
+        if count != 0: 
+            tgt_window = 1.
+        else: 
+            tgt_window = 0.
+
+#         tgt_window = count * len(self.motif_str) / self.target_window
+
+#         tgt = np.zeros(seq_subset.shape)
+#         tgt[np.where(seq_subset == 3.)] = 1.
+#         tgt_window = np.mean(tgt)
         return torch.tensor(dta), torch.tensor(tgt_window)
     
     def read_numpy_input(self, np_gq_name):
@@ -105,6 +115,22 @@ class DNA_Iter(Dataset):
         stacked_means_pdx = self.get_stacked_means(idx, tgt_mmap_pdx, num_targets_pdx)
         stacked_full = torch.cat((stacked_means_cl, stacked_means_pdx)).view(stacked_means_cl.shape[0] + stacked_means_pdx.shape[0])
         return stacked_full
+    
+    def find_str(self, rand_lst_str, motif_lst_str):
+        return rand_lst_str.find(motif_lst_str)
+
+    def count_substr(self, rand_lst_str, motif_lst_str):
+        upd_str = rand_lst_str
+        count = 0
+        while True:
+            ind = self.find_str(upd_str, motif_lst_str)
+            if ind != -1:         
+                upd_str = upd_str[ind + len(motif_lst_str):]
+                count += 1
+            else: 
+                break
+        return count 
+    
     
 def make_dsets(input_files_dir):
     cut = .8
